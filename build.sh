@@ -37,3 +37,19 @@ fi
 
 echo "Built: $APP (identity: $(codesign -dvvv "$APP" 2>&1 | grep -o 'Authority=[^ ]*.*' | head -1))"
 xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+
+# Canonical install: /Applications is the single bundle the app + login item
+# use. build/ stays as the compile output; don't launch from it (a second
+# instance with the same bundle ID would double-tap events).
+INSTALL=/Applications/BallScroll.app
+if [ -w /Applications ]; then
+    pkill -f "BallScroll.app/Contents/MacOS/BallScroll" 2>/dev/null || true
+    rm -rf "$INSTALL"
+    cp -R "$APP" "$INSTALL"
+    codesign --force --sign "BallScroll Development" "$INSTALL" 2>/dev/null \
+        || codesign --force --sign - "$INSTALL"
+    xattr -dr com.apple.quarantine "$INSTALL" 2>/dev/null || true
+    echo "Installed: $INSTALL"
+else
+    echo "/Applications not writable — skip install (launch from build/ manually)"
+fi

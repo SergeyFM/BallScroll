@@ -15,6 +15,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single-instance guard (NFR): another BallScroll already running → exit
+        // so we never run two taps over the same events (e.g. dev build/ copy
+        // alongside the /Applications install, or a manual double-launch).
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: "com.sergey.BallScroll")
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        if !others.isEmpty {
+            DebugLog.log("single-instance: another BallScroll (pid \(others[0].processIdentifier)) is running — exiting")
+            NSApp.terminate(nil)
+            return
+        }
+
         NSApp.setActivationPolicy(.accessory) // menu-bar only
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -40,6 +51,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // NFR-4: wake from sleep → re-arm tap + refresh device sources.
         registerWakeObservers()
+
+        // One-shot: user wants it as a normal always-on app → enable the login
+        // item automatically (FR-11). No-op if already registered; idempotent.
+        if !prefs.loginItemEnabled { prefs.loginItemEnabled = true }
 
         // Menu-bar (.accessory) apps never "become active", so the didBecomeActive
         // hook alone misses permission grants made in System Settings. Poll both

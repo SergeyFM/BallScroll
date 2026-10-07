@@ -55,7 +55,7 @@ enum ProbePosition: Int, CaseIterable, Codable {
 /// event-tap callback on every event, so changes apply immediately (FR-3/4/6/7).
 final class PreferencesModel: ObservableObject {
     @Published var enabled = true            // FR-11 global toggle (default ON)
-    @Published var invertDirection = false   // FR-4
+    @Published var invertDirection = true    // FR-4 — user preference: reversed by default
     @Published var horizontalScrolling = false // FR-3, default OFF (vertical-only)
     @Published var speedMultiplier = Double(SettingsKeys.defaultSpeed) // FR-6, default 3
     @Published var emulateInertia = true     // FR-7, default ON
@@ -99,9 +99,9 @@ final class PreferencesModel: ObservableObject {
     func load() {
         defaults.register(defaults: [
             SettingsKeys.enabled: true,
-            SettingsKeys.invert: false,
+            SettingsKeys.invert: true,   // user default: reversed scroll
             SettingsKeys.horizontal: false,
-            SettingsKeys.speed: SettingsKeys.defaultSpeed,
+            SettingsKeys.speed: Double(SettingsKeys.defaultSpeed),
             SettingsKeys.inertia: true,
         ])
         enabled = defaults.bool(forKey: SettingsKeys.enabled)
