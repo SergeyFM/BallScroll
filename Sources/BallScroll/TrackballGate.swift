@@ -1,20 +1,14 @@
-//  TrackballGate.swift — FR-8 device gate, driven by raw IOHID input reports.
+//  TrackballGate.swift — T-BC21 presence + first-run button probe (COLD PATH).
 //
-//  `CGEventGetSource` is not available in this SDK (verified at link time), so
-//  a CGEvent cannot be attributed to its HID device. The gate therefore owns an
-//  IOHIDManager matched EXACTLY to the T-BC21 (0x46D:0xC3C) and runs it on a
-//  dedicated background run loop. It exposes, under one lock:
-//    * connection state (removal callback clears it) — NFR-4
-//    * lastActivity     (monotonic time of the latest raw report)
-//    * pending movement (raw ball X/Y deltas accumulated since last drain)
-//  and fires, on a background thread (engine hops to main):
-//    * onPress / onRelease with the physical HID bit index + monotonic time.
-//
-//  The engine (main run loop, CG tap) reads this state per event. Because the
-//  gate only sees trackball reports, "affects only the T-BC21" (FR-8) is built
-//  in: Magic Mouse / trackpad events never move the gate, so they are always
-//  passed through untouched (AC #8). Raw deltas bypass the macOS pointer
-//  pipeline, so no cursor acceleration is baked into scroll (G1 linearity).
+//  In the AM-style engine, gestures run entirely on the CG event tap; this gate
+//  owns an IOHIDManager matched EXACTLY to the T-BC21 (0x46D:0xC408 at the
+//  HID layer) to provide:
+//    * connection state for the menu bar (onChange),
+//    * physical button edges (onPress) used by the FR-10 probe.
+//  It is NOT consulted per event in the gesture hot path anymore — that was the
+//  old design whose mixed clocks (IOHID callback vs CACurrentMediaTimeNow in
+//  the tap) made isActive() unreliable. Kept lock-guarded; callbacks fire on
+//  whatever run loop it is scheduled with (main, common modes).
 
 import Foundation
 import IOKit.hid
@@ -22,7 +16,13 @@ import CoreGraphics
 
 final class TrackballGate {
     static let vendorID = 0x46D   // Logitech
-    static let productID = 0xC3C  // USB Trackball / Marble T-BC21
+
+    /// NOTE: the IOHID layer reports a DIFFERENT ProductID than the USB level.
+    /// ioreg (USB) shows idProduct 0xC3C ("USB Trackball"), but
+    /// IOHIDManagerSetDeviceMatching only matches 0xC408 (verified empirically:
+    /// pid=0xC3C → 0 devices, pid=0xC408 → 1 device). Use the HID-layer ID.
+    static let productID = 0xC408  // T-BC21 at the IOHID layer
+    static let usbProductID = 0xC3C // USB-level id (for display/ioreg only)
 
     /// Physical button bit indices (HID report byte 0, bit n-1 = libinput btn_n):
     /// largeLeft=bit0, (emulated middle)=bit1, largeRight=bit2,
@@ -33,14 +33,10 @@ final class TrackballGate {
     static let idxSmallLeft   = 3
     static let idxSmallRight  = 4
 
-    struct Movement { var dx: CGFloat; var dy: CGFloat }
-
     private let lock = NSLock()
     private var connected = false
-    private var lastActivity: CFTimeInterval = 0          // monotonic
+    private var lastActivity: CFTimeInterval = 0          // monotonic (unused, kept for diagnostics)
     private var buttonsDown: Set<Int> = []                // bit indices
-    private var pendingDX: CGFloat = 0
-    private var pendingDY: CGFloat = 0
 
     private var manager: IOHIDManager?
 
@@ -89,8 +85,10 @@ final class TrackballGate {
             NSLog("BallScroll: IOHIDManagerOpen = \(openResult) (needs Input Monitoring?)")
         }
 
-        // Device may already be plugged in before start().
-        if let devs = IOHIDManagerCopyDevices(manager) as? [IOHIDDevice], !devs.isEmpty {
+        // Device may already be plugged in before start(). NOTE: this returns a
+        // CFSet — casting to [IOHIDDevice] always fails, so count via the
+        // CF API (the matching callback below still fires post-Open regardless).
+        if let set = IOHIDManagerCopyDevices(manager), CFSetGetCount(set) > 0 {
             noteConnect()
         } else {
             DebugLog.log("start: no matched device yet (IOHIDManagerOpen=\(openResult))")
@@ -106,48 +104,24 @@ final class TrackballGate {
         manager = nil
     }
 
-    // MARK: State access (thread-safe; the engine reads these per event)
-
-    /// True if the trackball is connected and produced a report within `window` s.
-    func isActive(window: CFTimeInterval) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return connected && (CACurrentMediaTimeNow() - lastActivity) <= window
-    }
+    // MARK: State access (thread-safe; the menu bar + probe read these)
 
     var isConnected: Bool { lock.lock(); defer { lock.unlock() }; return connected }
-
-    /// Drain accumulated raw ball movement since the last call (main loop only).
-    func drainMovement() -> Movement? {
-        lock.lock(); defer { lock.unlock() }
-        if pendingDX == 0 && pendingDY == 0 { return nil }
-        let m = Movement(dx: pendingDX, dy: pendingDY)
-        pendingDX = 0; pendingDY = 0
-        return m
-    }
-
-    /// Drop any accumulated movement (called when arming, so the button press's
-    /// own jitter isn't counted toward the deadzone). Main loop only.
-    func clearPendingMovement() {
-        lock.lock(); pendingDX = 0; pendingDY = 0; lock.unlock()
-    }
 
     // MARK: - Handlers (fire on the main run loop — keep them light)
 
     private func handleReport(_ ptr: UnsafeMutablePointer<UInt8>, len: Int) {
         let now = CACurrentMediaTimeNow()
+
         guard len >= 3 else { return }
 
         let mask = Int(ptr[0])
         var newDown: Set<Int> = []
         for i in 0..<8 where (mask >> i) & 1 == 1 { newDown.insert(i) }
 
-        // Raw pointer deltas are signed bytes (little-endian, mouse usage page).
-        let dx = CGFloat(Int8(bitPattern: ptr[1]))
-        let dy = CGFloat(Int8(bitPattern: ptr[2]))
-
         // Throttled: raw reports fire ~60–125 Hz; we want to see activity,
         // not flood the file. State transitions (press/release) log separately.
-        DebugLog.logThrottled("report len=\(len) mask=0b\(String(mask, radix: 2)) dx=\(dx) dy=\(dy)", atMostEvery: 0.5)
+        DebugLog.logThrottled("report len=\(len) mask=0b\(String(mask, radix: 2))", atMostEvery: 1.0)
 
         lock.lock()
         for b in newDown where !buttonsDown.contains(b) {
@@ -160,11 +134,6 @@ final class TrackballGate {
         }
         buttonsDown = newDown
         lastActivity = now
-
-        // Accumulate always (the engine drains and decides: armed deadzone vs
-        // scrolling). No button filtering here — hold-to-scroll needs the moves.
-        pendingDX += dx
-        pendingDY += dy
         lock.unlock()
     }
 

@@ -10,7 +10,8 @@ enum SettingsKeys {
     static let speed = "ScrollSpeedMultiplier"
     static let inertia = "EmulateInertiaEffect"
     static let deadzone = "ScrollDeadzonePx"
-    static let activatorBit = "ActivatorButtonBit"          // Int: physical HID bit index
+    static let activatorBit = "ActivatorButtonBit"          // Int: physical HID bit index (probe)
+    static let activatorBtnNumber = "ActivatorButtonCGNumber" // Int64: CG .mouseEventButtonNumber (engine)
     static let probedBits = "ProbedButtonBits"              // JSON: [positionRaw: bit]
     static let probeDone = "ButtonProbeCompleted"
 
@@ -60,7 +61,13 @@ final class PreferencesModel: ObservableObject {
     @Published var emulateInertia = true     // FR-7, default ON
     @Published var deadzonePx: Double        // FR-13
     @Published var activatorBit = SettingsKeys.defaultActivatorBit   // FR-5, default small right (bit 4)
+    /// CG .mouseEventButtonNumber of the activator — what the engine actually
+    /// matches against (AM-style). Set by probing; 3 = first extra button, the
+    /// standard macOS number for a mouse's secondary side/extra buttons.
+    @Published var activatorCGButton = 3
     @Published var probedBits: [ProbePosition: Int] = [:]            // FR-10
+    /// Last CG .mouseEventButtonNumber seen by the engine on a down (probe use).
+    var lastSeenCGButton = 3
     @Published var probeCompleted = false
 
     /// Device / permission state surfaced in the UI.
@@ -105,6 +112,7 @@ final class PreferencesModel: ObservableObject {
 
         activatorBit = (defaults.object(forKey: SettingsKeys.activatorBit) as? Int)
             ?? SettingsKeys.defaultActivatorBit
+        activatorCGButton = (defaults.object(forKey: SettingsKeys.activatorBtnNumber) as? Int) ?? 3
 
         if let data = defaults.data(forKey: SettingsKeys.probedBits),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Int] {
@@ -126,6 +134,7 @@ final class PreferencesModel: ObservableObject {
         defaults.set(emulateInertia, forKey: SettingsKeys.inertia)
         defaults.set(deadzonePx, forKey: SettingsKeys.deadzone)
         defaults.set(activatorBit, forKey: SettingsKeys.activatorBit)
+        defaults.set(Int(activatorCGButton), forKey: SettingsKeys.activatorBtnNumber)
 
         var probeObj: [String: Int] = [:]
         for (pos, bit) in probedBits { probeObj[String(pos.rawValue)] = bit }
@@ -183,8 +192,10 @@ final class PreferencesModel: ObservableObject {
         // Single-mode probe: the probed button is also chosen as activator.
         if !probeSequential {
             activatorBit = bit
+            // The CG number the engine will actually match against (AM-style).
+            activatorCGButton = lastSeenCGButton
             probeActivePosition = nil
-            probeStatusText = "Recorded \"\(pos.displayName)\" — now the scroll button."
+            probeStatusText = "Recorded \"\(pos.displayName)\" — now the scroll button (CG number \(lastSeenCGButton))."
             persist()
             return
         }

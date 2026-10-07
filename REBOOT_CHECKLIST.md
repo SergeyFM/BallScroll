@@ -1,39 +1,51 @@
-# BallScroll — Reboot Checklist
+# BallScroll — Status & Reboot Notes
 
-The app is built, signed (ad-hoc), and was running healthy for 15h pre-reboot
-(`AXTrusted=true`, event tap installed). It is **paused** — the only thing it's
-waiting on is a device, which needs **Input Monitoring**, and that grant only
-takes effect after a reboot.
+## Current state: WORKING (verified on this machine)
+Hold the small-right button (T‑BC21), roll → cursor pins, page scrolls.
+Verified: 16/16 clean `ARMED → SCROLLING → RELEASE` cycles in
+`~/ballscroll_debug.log`.
 
-## What changed in this build (cdhash `ccf86e52…`)
-- The device gate now reads **raw IOHID** (this SDK has no `CGEventGetSource`),
-  so it needs **Input Monitoring** in addition to Accessibility. The app now:
-  - requests *both* on first run,
-  - re-checks both when it's activated and **restarts the gate** if Input
-    Monitoring was just granted (no relaunch needed after that),
-  - shows both in the menu + Settings banner.
+Architecture (modeled on Abnormal Mouse's MoveToScroll, same repo as the
+reference behavior):
+- **One active CG session event tap** is the entire gesture path — no IOHID in
+  the hot loop. (The earlier dual-pipeline design mixed two clocks — IOHID's
+  callback time vs `CACurrentMediaTimeNow()` in the tap — so "trackball active"
+  was computed wrong and every gesture bailed to pass-through.)
+- Hold detection = the tap's `CGEventField.mouseEventButtonNumber` == activator.
+  This device's extra button reports **button number 4** (measured; stored in
+  `ActivatorButtonCGNumber`). Left button = 0.
+- Ball movement while held = the move event's built-in `mouseEventDeltaX/Y`,
+  consumed (no cursor drift) + `CGWarpMouseCursorPosition` re-pin each move.
+- Scroll output = pixel-unit wheel events, `isContinuous=1`, explicit scroll
+  phases (began/changed/ended) — AM's exact event format.
+- Device scoping is implicit (like AM): only the T‑BC21 has button 4, so Magic
+  Mouse / trackpad events can't arm a gesture (FR‑8). The IOHID gate is now
+  cold-path only: connection status for the menu bar + first-run button probe.
 
-## Step-by-step
-1. **Reboot.**
-2. After login, BallScroll should be running (or start it — see launch note).
-3. Watch `~/ballscroll_debug.log`. When the gate sees the trackball it logs:
-   ```
-   DEVICE CONNECTED
-   ```
-4. **Then tell me** (or just use the trackball). I'll read the log, confirm
-   the button bits + ball deltas, and verify hold-to-scroll end to end.
+## Permissions (the churn is fixed)
+- Signed with a **stable self-signed identity** "BallScroll Development"
+  (login keychain, cert `/tmp/bsdev.crt`, PKCS12 password `ballscroll`).
+  Ad-hoc signing changed the CDHash every build → TCC treated each rebuild as a
+  new app and dropped grants (the "it's always been on" problem). `build.sh`
+  now signs with that identity (ad-hoc fallback only if the cert is missing).
+- Grants that matter: **Accessibility** (event tap) + **Input Monitoring**
+  (raw IOHID gate). Both currently ON; a rebuild no longer invalidates them.
+- App self-arms via a background poller when grants change (no modal dialogs,
+  no relaunch needed).
 
-## Launch note (pick one)
-- **Auto at login** — I can enable the SMAppService login item now so it
-  starts on its own after reboot. (Default I'd recommend.)
-- **Manual** — `open ~/Documents/Trackball_mac_utility/build/BallScroll.app`
-  (or run `./build/BallScroll.app/Contents/MacOS/BallScroll` with
-  `BALLSCROLL_DEBUG_LOG=1`).
+## Reboot notes
+- If BallScroll isn't running after login: `open ~/Documents/Trackball_mac_utility/build/BallScroll.app`
+  (login item via SMAppService is available in Settings).
+- Health check: `head ~/ballscroll_debug.log` should show
+  `engine.start (AM-style single tap): AXTrusted=true enabled=true`,
+  `gate started: open=0 connected=true` (open=0 = Input Monitoring OK),
+  `event tap installed`.
+- If a grant ever drops again (e.g. macOS update): toggle BallScroll back on in
+  System Settings → Privacy & Security → Accessibility and Input Monitoring.
 
-## If the gate still shows no device after reboot
-- Confirm BallScroll is in **System Settings → Privacy & Security**:
-  - *Accessibility* (on) — for the event tap.
-  - *Input Monitoring → ListenEvent* / HID (on) — for the raw gate.
-- The log line `IOHIDManagerOpen=0` + `connected=false` after a reboot means
-  the HID grant is still pending; toggle BallScroll in Input Monitoring and it
-  will be picked up on the next activation (the gate restarts automatically).
+## Tuning knobs (UserDefaults `com.sergey.BallScroll`)
+- `ActivatorButtonCGNumber` — which button arms (default 4 = small right).
+- `ScrollSpeedMultiplier` (3), `InvertScrollDirection`,
+  `EnableHorizontalScrolling`, `EmulateInertiaEffect` (off — inertia tail was
+  disabled during bring-up; safe to re-enable and test), `ScrollDeadzonePx` (2).
+- Debug logging: set `BallScrollDebugLog=1` to keep writing the log file.

@@ -24,7 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the raw IOHID gate). Start now; it self-disables until permitted.
         BallScrollEngine.shared.onProbeButtonPressed = { [weak self] bit in
             // Fired by the gate (hopped to main) → dispatch before touching UI.
-            DispatchQueue.main.async { self?.prefs.handleProbedButton(bit: bit) }
+            // Small delay: let the engine's onProbeCGDown land first so the
+            // CG button number (the identity we actually match) is recorded.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self?.prefs.handleProbedButton(bit: bit) }
+        }
+        BallScrollEngine.shared.onProbeCGDown = { [weak self] number in
+            DispatchQueue.main.async { self?.prefs.lastSeenCGButton = number }
         }
         BallScrollEngine.shared.start(prefs: prefs, enabled: AXPermissions.isTrusted && prefs.enabled)
 
@@ -35,6 +40,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // NFR-4: wake from sleep → re-arm tap + refresh device sources.
         registerWakeObservers()
+
+        // Menu-bar (.accessory) apps never "become active", so the didBecomeActive
+        // hook alone misses permission grants made in System Settings. Poll both
+        // TCC states until fully granted, then re-arm (FR-12). Cheap: two API calls
+        // / 1.5s; stops once both are true (wake re-check still covers later).
+        startPermissionPoller()
 
         // First-run: prompt for the permissions we're missing, then guide to
         // the button probe. (Input Monitoring is needed because the device gate
@@ -82,33 +93,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPermissionPanel() {
         guard !AXPermissions.isTrusted || !AXPermissions.inputMonitoringGranted else { return }
 
-        // Fire the native prompts (each shows once per identity).
+        // Fire the native system prompts (each shows once per identity). We
+        // deliberately avoid our own modal NSAlert here: a menu-bar (.accessory)
+        // app has no window to host it, so it would either fall back to runModal
+        // (blocking the main loop + our poller) or float invisibly behind other
+        // windows. Instead the app self-arms via the background permission
+        // poller, and the Settings window (menu bar icon) offers an explicit
+        // "Open System Settings…" button for manual action.
         if !AXPermissions.isTrusted { AXPermissions.requestPrompt() }
         AXPermissions.requestInputMonitoring()
-
-        let alert = NSAlert()
-        alert.messageText = "BallScroll needs two permissions"
-        var missing = [String]()
-        if !AXPermissions.isTrusted { missing.append("Accessibility — to watch and consume the trackball's mouse events (like Abnormal Mouse)") }
-        if !AXPermissions.inputMonitoringGranted { missing.append("Input Monitoring — to read the trackball's raw button + ball reports (device identification)") }
-        alert.informativeText = """
-        \(missing.joined(separator: "\n"))
-
-        BallScroll does not read your keystrokes and sends no data off this Mac.
-        If the toggle isn't available, open System Settings → Privacy & Security.
-        """
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Later")
-
-        let open = { AXPermissions.openAccessibilitySettings(); AXPermissions.openInputMonitoringSettings() }
-        if let window = NSApp.keyWindow ?? NSApp.windows.first {
-            alert.beginSheetModal(for: window) { response in
-                if response == .alertFirstButtonReturn { open() }
-            }
-        } else {
-            let response = alert.runModal()
-            if response == .alertFirstButtonReturn { open() }
-        }
+        DebugLog.log("permission prompts fired (poller will self-arm on grant)")
     }
 
     // MARK: - Menu bar dropdown (PRD §9)
@@ -201,6 +195,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(handleWake),
             name: NSWorkspace.didWakeNotification, object: nil)
+    }
+
+    // MARK: - Permission polling (FR-12, menu-bar apps don't get didBecomeActive)
+
+    private var permissionPollTimer: Timer?
+    private func startPermissionPoller() {
+        guard !AXPermissions.isTrusted || !AXPermissions.inputMonitoringGranted else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            let trusted = AXPermissions.isTrusted
+            let imGranted = AXPermissions.inputMonitoringGranted
+            if trusted != self.prefs.hasAccessibilityPermission { DebugLog.log("poll: Accessibility -> \(trusted)") }
+            if imGranted != self.prefs.hasInputMonitoringPermission { DebugLog.log("poll: Input Monitoring -> \(imGranted)") }
+            self.refreshPermissionState() // installs/restarts tap+gate on change, updates menu
+            if trusted && imGranted {
+                t.invalidate()
+                self.permissionPollTimer = nil
+            }
+        }
+        permissionPollTimer = timer
     }
 
     @objc private func handleWake() {
