@@ -19,6 +19,9 @@ xcrun swiftc \
     -o "$BIN"
 
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+# App icon (Finder/Dock/Get Info) — matches the menu-bar arrow.up.arrow.down.
+mkdir -p "$APP/Contents/Resources"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # PkgInfo (harmless, helps some launchers)
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
