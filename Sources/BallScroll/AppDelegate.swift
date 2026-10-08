@@ -57,6 +57,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.refreshPermissionState() }
             .store(in: &cancellables)
 
+        // Device / permission state changes → refresh the menu-bar icon
+        // immediately. Previously only a click (didBecomeActive) or the 1.5s
+        // permission poller triggered rebuildMenu, so at launch the icon kept
+        // showing the "attention" mark until you clicked it even though the
+        // trackball had already connected.
+        prefs.$trackballConnected
+            .sink { [weak self] _ in self?.refreshMenu() }
+            .store(in: &cancellables)
+        prefs.$hasAccessibilityPermission
+            .sink { [weak self] _ in self?.refreshMenu() }
+            .store(in: &cancellables)
+        prefs.$hasInputMonitoringPermission
+            .sink { [weak self] _ in self?.refreshMenu() }
+            .store(in: &cancellables)
+
         // NFR-4: wake from sleep → re-arm tap + refresh device sources.
         registerWakeObservers()
 
