@@ -31,6 +31,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         rebuildMenu()
 
+        // statusItem.button can be nil on the first run-loop turn after creation
+        // (macOS version-dependent) — rebuildMenu's guard then no-ops and the menu
+        // bar shows nothing until a click (didBecomeActive) re-triggers it. Re-apply
+        // the icon once the button is actually ready so it's visible at launch.
+        DispatchQueue.main.async { [weak self] in
+            if let b = self?.statusItem.button, b.image == nil { self?.rebuildMenu() }
+        }
+
         // Engine (FR-12: needs Accessibility for the tap, Input Monitoring for
         // the raw IOHID gate). Start now; it self-disables until permitted.
         BallScrollEngine.shared.onProbeButtonPressed = { [weak self] bit in
@@ -122,14 +130,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu bar dropdown (PRD §9)
 
+    /// Template menu-bar glyph — the trackball itself: a groove ring with the
+    /// ball centered in it (normal), or an "!" in the ring when permissions /
+    /// device are missing. Monochrome + isTemplate so it renders correctly in
+    /// both light and dark menu bars (a colored image would vanish on one).
+    static func menuBarIcon(warning: Bool) -> NSImage {
+        let size = NSSize(width: 20, height: 20)
+        let img = NSImage(size: size, flipped: false) { rect in
+            let c = NSPoint(x: rect.midX, y: rect.midY)
+            // Groove ring (the trackball bearing contour).
+            let ringR: CGFloat = 7.6
+            let ring = NSBezierPath(ovalIn: CGRect(x: c.x - ringR, y: c.y - ringR,
+                                                   width: ringR * 2, height: ringR * 2))
+            NSColor.black.setStroke()
+            ring.lineWidth = 1.7
+            ring.stroke()
+            if warning {
+                // "!" in the center — something needs attention.
+                let dotR: CGFloat = 0.95
+                NSColor.black.setFill()
+                let barTop = c.y + 3.4, barH: CGFloat = 4.6
+                NSBezierPath(ovalIn: CGRect(x: c.x - dotR, y: barTop + 1.6,
+                                            width: dotR * 2, height: dotR * 2)).fill()
+                let barW: CGFloat = 1.7, barX = c.x - barW / 2
+                let barRect = CGRect(x: barX, y: c.y - 4.1, width: barW, height: barH)
+                NSBezierPath(roundedRect: barRect, xRadius: 0.85, yRadius: 0.85).fill()
+            } else {
+                // The ball, seated in the groove.
+                let ballR: CGFloat = 4.1
+                NSColor.black.setFill()
+                NSBezierPath(ovalIn: CGRect(x: c.x - ballR, y: c.y - ballR,
+                                            width: ballR * 2, height: ballR * 2)).fill()
+            }
+            return true
+        }
+        img.isTemplate = true
+        img.accessibilityDescription = warning ? "BallScroll — attention needed" : "BallScroll"
+        return img
+    }
+
     private func rebuildMenu() {
         guard let button = statusItem.button else { return }
-        if prefs.hasAccessibilityPermission && prefs.hasInputMonitoringPermission && BallScrollEngine.shared.isTrackballConnected() {
-            button.image = NSImage(systemSymbolName: "arrow.up.arrow.down", accessibilityDescription: "BallScroll")
-        } else {
-            button.image = NSImage(systemSymbolName: "arrow.up.arrow.down.circle.badge.exclamationmark",
-                                   accessibilityDescription: "BallScroll")
-        }
+        let ok = prefs.hasAccessibilityPermission && prefs.hasInputMonitoringPermission && BallScrollEngine.shared.isTrackballConnected()
+        button.image = AppDelegate.menuBarIcon(warning: !ok)
 
         let menu = NSMenu()
         let trusted = prefs.hasAccessibilityPermission
