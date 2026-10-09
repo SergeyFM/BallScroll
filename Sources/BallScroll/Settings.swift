@@ -9,6 +9,9 @@ enum SettingsKeys {
     static let horizontal = "EnableHorizontalScrolling"
     static let speed = "ScrollSpeedMultiplier"
     static let inertia = "EmulateInertiaEffect"
+    static let inertiaDecayMs = "InertiaDecayMs"        // 25…1000 ms, default 80 — brake-to-stop time after release
+    static let inertiaStrength = "InertiaStrength"      // legacy (0.1…3.0) — migrated into InertiaDecayMs
+    static let inertiaMigrated = "InertiaDecayMigrated" // Bool — set once the legacy value was migrated
     static let deadzone = "ScrollDeadzonePx"
     static let activatorBit = "ActivatorButtonBit"          // Int: physical HID bit index (probe)
     static let activatorBtnNumber = "ActivatorButtonCGNumber" // Int64: CG .mouseEventButtonNumber (engine)
@@ -59,6 +62,11 @@ final class PreferencesModel: ObservableObject {
     @Published var horizontalScrolling = false // FR-3, default OFF (vertical-only)
     @Published var speedMultiplier = Double(SettingsKeys.defaultSpeed) // FR-6, default 3
     @Published var emulateInertia = true     // FR-7, default ON
+    /// Inertia decay time (ms): how long after release it takes for the glide to
+    /// brake smoothly to a stop. Log-scale slider 25…1000 (sub-ms precision at the
+    /// bottom — internally ms with sub-millisecond steps; the "microsecond scale"
+    /// you asked for). 25 ms ≈ no visible inertia; 1000 ms = a long roll-out.
+    @Published var inertiaDecayMs: Double = 80
     @Published var deadzonePx: Double        // FR-13
     @Published var activatorBit = SettingsKeys.defaultActivatorBit   // FR-5, default small right (bit 4)
     /// CG .mouseEventButtonNumber of the activator — what the engine actually
@@ -68,6 +76,10 @@ final class PreferencesModel: ObservableObject {
     @Published var probedBits: [ProbePosition: Int] = [:]            // FR-10
     /// Last CG .mouseEventButtonNumber seen by the engine on a down (probe use).
     var lastSeenCGButton = 3
+    /// Transient live feedback (not persisted): true while the current scroll
+    /// button is physically pressed — the settings UI flashes the button + its
+    /// code bright red so you can see it's working.
+    @Published var activatorPressed = false
     @Published var probeCompleted = false
 
     /// Device / permission state surfaced in the UI.
@@ -103,12 +115,25 @@ final class PreferencesModel: ObservableObject {
             SettingsKeys.horizontal: false,
             SettingsKeys.speed: Double(SettingsKeys.defaultSpeed),
             SettingsKeys.inertia: true,
+            SettingsKeys.inertiaDecayMs: 80.0,
         ])
         enabled = defaults.bool(forKey: SettingsKeys.enabled)
         invertDirection = defaults.bool(forKey: SettingsKeys.invert)
         horizontalScrolling = defaults.bool(forKey: SettingsKeys.horizontal)
         speedMultiplier = (defaults.object(forKey: SettingsKeys.speed) as? Double) ?? Double(SettingsKeys.defaultSpeed)
         emulateInertia = defaults.bool(forKey: SettingsKeys.inertia)
+        // One-time migration from the old 0.1…3 strength lever: higher old values
+        // meant a longer roll-out, so map monotonically into the new decay time.
+        // (Must use a dedicated flag: register() above already puts a default under
+        // the InertiaDecayMs key, so object(forKey:) can't tell "unset".)
+        if !defaults.bool(forKey: SettingsKeys.inertiaMigrated),
+           let old = defaults.object(forKey: SettingsKeys.inertiaStrength) as? Double {
+            inertiaDecayMs = min(1000, max(25, 40 + old * 300))
+            defaults.set(true, forKey: SettingsKeys.inertiaMigrated)
+            persist()
+        } else {
+            inertiaDecayMs = (defaults.object(forKey: SettingsKeys.inertiaDecayMs) as? Double) ?? 80
+        }
 
         activatorBit = (defaults.object(forKey: SettingsKeys.activatorBit) as? Int)
             ?? SettingsKeys.defaultActivatorBit
@@ -132,6 +157,7 @@ final class PreferencesModel: ObservableObject {
         defaults.set(horizontalScrolling, forKey: SettingsKeys.horizontal)
         defaults.set(speedMultiplier, forKey: SettingsKeys.speed)
         defaults.set(emulateInertia, forKey: SettingsKeys.inertia)
+        defaults.set(inertiaDecayMs, forKey: SettingsKeys.inertiaDecayMs)   // superseded InertiaStrength left for migration
         defaults.set(deadzonePx, forKey: SettingsKeys.deadzone)
         defaults.set(activatorBit, forKey: SettingsKeys.activatorBit)
         defaults.set(Int(activatorCGButton), forKey: SettingsKeys.activatorBtnNumber)
@@ -167,13 +193,44 @@ final class PreferencesModel: ObservableObject {
     func startSingleProbe(_ position: ProbePosition) {
         probeActivePosition = position
         probeSequential = false
-        probeStatusText = "Now press the \"\(position.displayName)\" button on the trackball…"
+        // Single (one-shot) probe: any button press wins, so don't name a
+        // specific position (codes only). The sequential "probe all" flow sets
+        // its own per-position text in updateProbeStatus.
+        probeStatusText = ""
     }
 
     func cancelProbe() {
         probeActivePosition = nil
         probeSequential = false
         probeStatusText = ""
+    }
+
+    // MARK: Live "scroll button pressed" feedback (settings UI red)
+
+    private var pressSafety: DispatchWorkItem?
+
+    /// Driven by the engine's real button edges: `pressed == true` on down,
+    /// `false` on the paired up. The settings UI stays bright red for as long as
+    /// the trackball button is physically held (no timed flash that goes back to
+    /// grey a second later). A long safety timer only recovers from a lost up
+    /// event (e.g. trackball unplugged mid-press).
+    func noteActivator(pressed: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if pressed {
+                self.activatorPressed = true
+                self.pressSafety?.cancel()
+                let w = DispatchWorkItem { [weak self] in
+                    guard let self, self.activatorPressed else { return }
+                    self.activatorPressed = false   // safety: up event never arrived
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: w)
+                self.pressSafety = w
+            } else {
+                self.activatorPressed = false
+                self.pressSafety?.cancel()
+            }
+        }
     }
 
     /// Engine reports a real button press as its physical HID bit. Records it
@@ -195,7 +252,8 @@ final class PreferencesModel: ObservableObject {
             // The CG number the engine will actually match against (AM-style).
             activatorCGButton = lastSeenCGButton
             probeActivePosition = nil
-            probeStatusText = "Recorded \"\(pos.displayName)\" — now the scroll button (CG number \(lastSeenCGButton))."
+            // Code-first confirmation — no button-name labels.
+            probeStatusText = "Scroll button set — Button \(lastSeenCGButton)."
             persist()
             return
         }

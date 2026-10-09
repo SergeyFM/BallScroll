@@ -52,7 +52,7 @@ final class BallScrollEngine {
     private var armedDX: CGFloat = 0
     private var armedDY: CGFloat = 0
 
-    // Inertia (FR-7) — velocity in px/s from the last move batches.
+    // Inertia (FR-7) — velocity in posted px/s, low-passed from the last moves.
     private var velocity: (x: CGFloat, y: CGFloat) = (0, 0)
     private var lastMoveTime: CFTimeInterval?
     private var inertiaTimer: Timer?
@@ -186,10 +186,24 @@ final class BallScrollEngine {
         let buttonNumber = event.getIntegerValueField(.mouseEventButtonNumber)
         let activator = Int64(model.activatorCGButton)
 
-        // Probe mode (FR-10): everything passes through; the gate records bits.
+        // Raw live feedback for the scroll-button picker — independent of arming
+        // so it stays bright red exactly while that trackball button is held and
+        // returns to grey on the paired up (no timed flash). In probe mode any
+        // button's press lights it, so you can see the app is listening.
         if model.probeActivePosition != nil {
-            if isDown { onProbeCGDown?(Int(buttonNumber)) }
+            if isDown {
+                onProbeCGDown?(Int(buttonNumber))
+                model.noteActivator(pressed: true)   // live "it's listening" indicator
+            } else if isUp {
+                model.noteActivator(pressed: false)
+            }
             return Unmanaged.passUnretained(event)
+        }
+
+        if isDown && buttonNumber == activator {
+            model.noteActivator(pressed: true)   // red while held
+        } else if isUp && buttonNumber == activator {
+            model.noteActivator(pressed: false)  // grey on release
         }
 
         switch mode {
@@ -237,6 +251,9 @@ final class BallScrollEngine {
         armedDX = 0; armedDY = 0
         velocity = (0, 0); lastMoveTime = nil
         pinnedLocation = location
+        // If a momentum tail was still running, close it out (post its .ended) so
+        // we never leave a began-without-ended that confuses gesture-tracking apps.
+        if inertiaTimer != nil { postScrollPhase(v: 0, h: 0, phase: .ended) }
         stopInertiaTimer()
 
         DebugLog.log("ARMED (CG btn \(model.activatorCGButton), pin @\(Int(location.x)),\(Int(location.y)))")
@@ -268,9 +285,16 @@ final class BallScrollEngine {
 
     private func endScroll(model: PreferencesModel) {
         mode = .idle
-        postScrollPhase(v: 0, h: 0, phase: .ended)
-        DebugLog.log("RELEASE from SCROLLING (v=\(Int(velocity.x)),\(Int(velocity.y)))")
-        startInertiaTail(model)
+        // NOTE: no `.ended` here. The inertia tail (if any) continues the SAME
+        // gesture and posts its own `.ended` last — apps key on the final phase,
+        // so posting .ended before the momentum deltas made them look "outside a
+        // gesture" and some apps dropped them. If there is no inertia, post it now.
+        DebugLog.log("RELEASE from SCROLLING (v=\(Int(velocity.x)),\(Int(velocity.y))) t=\(String(format:"%.3f",CACurrentMediaTimeNow()))")
+        if startInertiaTail(model) {
+            // tail owns the .ended
+        } else {
+            postScrollPhase(v: 0, h: 0, phase: .ended)
+        }
     }
 
     private func disarm() {
@@ -286,6 +310,7 @@ final class BallScrollEngine {
         let now = CACurrentMediaTimeNow()
         lastMoveTime = now
         velocity = (0, 0)
+        scrollMoveCount = 0
 
         let speed = CGFloat(model.speedMultiplier)
         var sx: CGFloat = 0
@@ -297,9 +322,23 @@ final class BallScrollEngine {
     }
 
     private func scrollFromMove(dx: CGFloat, dy: CGFloat, model: PreferencesModel) {
-        let now = CACurrentMediaTimeNow()
-        if let last = lastMoveTime, now - last > 0 {
-            velocity = (dx / CGFloat(now - last), dy / CGFloat(now - last))
+        let now = CACurrentMediaTimeNow()   // NANOSECONDS (see note below)
+        var instX: CGFloat = 0
+        var instY: CGFloat = 0
+        // NOTE: CACurrentMediaTimeNow() returns NANOSECONDS (it multiplies mach
+        // ticks by numer/denom but omits the /1e9 its name implies) — a dt of
+        // ~2e7 means 20 ms. The original code divided by the raw (ns) dt, giving
+        // ~1e-6 px/s that Int()-rounded to 0, so `velocity` never left (0,0) and
+        // the inertia gate (v>25) never passed. Convert to seconds first.
+        if let last = lastMoveTime {
+            let dtSec = (now - last) / 1_000_000_000
+            if dtSec > 0.001 {   // skip same-timestamp batches (dt ≈ 0)
+                let spd = CGFloat(model.speedMultiplier)
+                instX = dx * spd / CGFloat(dtSec)   // posted px/s (both axes tracked,
+                instY = dy * spd / CGFloat(dtSec)   // so horizontal flings get inertia too)
+                velocity.x += (instX - velocity.x) * 0.4   // light low-pass
+                velocity.y += (instY - velocity.y) * 0.4   // light low-pass
+            }
         }
         lastMoveTime = now
 
@@ -308,9 +347,16 @@ final class BallScrollEngine {
         let sy = dy * speed
         if model.horizontalScrolling { sx = dx * speed }
 
+        scrollMoveCount += 1
+        if scrollMoveCount <= 3 || scrollMoveCount % 25 == 0 {
+            DebugLog.log("SCROLL move #\(scrollMoveCount) dx=\(Int(dx)) dy=\(Int(dy)) inst=(\(String(format:"%.0f",instX)),\(String(format:"%.0f",instY))) v=(\(Int(velocity.x)),\(Int(velocity.y)))")
+        }
+
         let sign: CGFloat = model.invertDirection ? -1 : 1
         postScrollPhase(v: sy * sign, h: sx * sign, phase: .changed)
     }
+
+    private var scrollMoveCount = 0
 
     /// Pixel-unit continuous scroll wheel with an explicit phase — AM's format,
     /// including the point-delta fields (kept consistent, PRD §8.5) and field
@@ -331,57 +377,65 @@ final class BallScrollEngine {
         ev.post(tap: .cghidEventTap)
     }
 
-    // MARK: - Inertia (FR-7) — short decaying tail with a momentum phase
+    // MARK: - Inertia (FR-7) — momentum tail, real pixel deltas.
+    // BUG FIX: the old postMomentumFrame built events with wheel1/wheel2 = 0 and
+    // only set the point-delta fields, but a continuous pixel-wheel scroll reads
+    // its movement from wheel1/wheel2 — so every momentum frame moved 0 px and
+    // the effect was invisible. We now reuse postScrollPhase(v:h:phase:) (the same
+    // path live rolling uses, which DOES scroll), with real pixel deltas.
+    // Returns true if a tail was started (it then owns the final `.ended` frame),
+    // false otherwise — so endScroll can post `.ended` itself when there's no tail.
 
-    private func startInertiaTail(_ model: PreferencesModel) {
-        guard model.emulateInertia else { velocity = (0, 0); return }
+    private func startInertiaTail(_ model: PreferencesModel) -> Bool {
+        guard model.emulateInertia else { velocity = (0, 0); return false }
 
-        let speedHypot = sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
-        guard speedHypot > 25 else { velocity = (0, 0); return }
+        // `velocity` is already in posted px/s (scroll rate at release, tracked in
+        // scrollFromMove). Need a real fling to carry momentum.
+        let relSpeed = sqrt(velocity.x * velocity.x + velocity.y * velocity.y)
+        guard relSpeed > 25 else { velocity = (0, 0); return false }
 
         stopInertiaTimer()
-        let decayPerSecond: CGFloat = 0.12
         let tick: CFTimeInterval = 1.0 / 60.0
 
-        // Momentum begin, then continuous frames (AM's format).
-        let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 0,
-                         wheel1: 0, wheel2: 0, wheel3: 0)
-        if let ev {
-            ev.setIntegerValueField(CGEventField(rawValue: 88)!, value: 1)   // IsContinuous
-            ev.setIntegerValueField(CGEventField(rawValue: 123)!, value: 1)  // MomentumPhase .begin
-            ev.post(tap: .cghidEventTap)
-        }
+        // Smooth braking (exponential): the glide starts at FULL release speed —
+        // exactly what your fingers were doing, so there's no sudden "drop" when you
+        // let go — and decays exponentially, reaching ~2% of release speed (i.e.
+        // imperceptible) exactly at the user's decay time. The lever IS that brake
+        // time: "how long after release it takes to stop." Small value = the page
+        // coasts a few pixels and stops (invisible inertia); large value = it keeps
+        // rolling for seconds.
+        let decayS = max(0.02, CGFloat(model.inertiaDecayMs) / 1000.0)   // e.g. 80 ms → 0.08 s
+        let sign: CGFloat = model.invertDirection ? -1 : 1
+        let doH = model.horizontalScrolling
+        var elapsed: CFTimeInterval = 0
 
         let timer = Timer(timeInterval: tick, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
-            var v = self.velocity
-            let f = CGFloat(exp(Double(-decayPerSecond * tick)))
-            v.x *= f; v.y *= f
+            elapsed += tick
+            // v(t) = v0 · e^(-4t/T): ≈91% of release at t=T/5, ~2% (imperceptible)
+            // exactly at the set decay time T. Pure exponential = perfectly smooth,
+            // no kink or plateau anywhere in the curve.
+            let f = exp(-4 * CGFloat(elapsed / decayS))
 
-            let sign: CGFloat = model.invertDirection ? -1 : 1
-            self.postMomentumFrame(v: v.y * tick * sign, h: (model.horizontalScrolling ? v.x : 0) * tick * sign)
-            self.velocity = (v.x, v.y)
-
-            let s2 = sqrt(v.x * v.x + v.y * v.y)
-            if self.mode != .idle || s2 < 8 {
+            // Stop when the per-frame movement is under half a pixel (or on re-arm):
+            // that lands just after T, so the effective coast ≈ the set decay time.
+            let mag = sqrt(self.velocity.x * self.velocity.x + self.velocity.y * self.velocity.y)
+            if self.mode != .idle || f * mag < 0.5 / CGFloat(tick) {
                 t.invalidate()
                 self.inertiaTimer = nil
+                DebugLog.log("TAIL stopped (t=\(String(format:"%.0f", elapsed * 1000))ms decay=\(Int(model.inertiaDecayMs.rounded()))ms)")
+                self.postScrollPhase(v: 0, h: 0, phase: .ended)
+                return
             }
+
+            self.postScrollPhase(v: self.velocity.y * f * tick * sign,
+                                 h: (doH ? self.velocity.x : 0) * f * tick * sign, phase: .changed)
         }
         timer.tolerance = 0.01
         RunLoop.main.add(timer, forMode: .common)
         inertiaTimer = timer
-    }
-
-    private func postMomentumFrame(v: CGFloat, h: CGFloat) {
-        let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 0,
-                         wheel1: 0, wheel2: 0, wheel3: 0)
-        guard let ev else { return }
-        ev.setIntegerValueField(CGEventField(rawValue: 88)!, value: 1)   // IsContinuous
-        ev.setIntegerValueField(CGEventField(rawValue: 123)!, value: 2)  // MomentumPhase .continue
-        ev.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(v.rounded()))
-        ev.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(h.rounded()))
-        ev.post(tap: .cghidEventTap)
+        DebugLog.log("TAIL started (startV=\(Int(velocity.x)),\(Int(velocity.y)) decay=\(Int(model.inertiaDecayMs.rounded()))ms)")
+        return true
     }
 
     private func stopInertiaTimer() {

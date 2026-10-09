@@ -95,7 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if !prefs.probeCompleted {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
                 guard let self else { return }
-                self.showSettings(tab: 0)
+                self.showSettings()
                 self.prefs.startSequentialProbe()
             }
         }
@@ -145,49 +145,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu bar dropdown (PRD §9)
 
-    /// Template menu-bar glyph — the trackball itself: a groove ring with the
-    /// ball centered in it (normal), or an "!" in the ring when permissions /
-    /// device are missing. Monochrome + isTemplate so it renders correctly in
-    /// both light and dark menu bars (a colored image would vanish on one).
-    static func menuBarIcon(warning: Bool) -> NSImage {
-        let size = NSSize(width: 20, height: 20)
-        let img = NSImage(size: size, flipped: false) { rect in
-            let c = NSPoint(x: rect.midX, y: rect.midY)
-            // Groove ring (the trackball bearing contour).
-            let ringR: CGFloat = 7.6
-            let ring = NSBezierPath(ovalIn: CGRect(x: c.x - ringR, y: c.y - ringR,
-                                                   width: ringR * 2, height: ringR * 2))
-            NSColor.black.setStroke()
-            ring.lineWidth = 1.7
-            ring.stroke()
-            if warning {
-                // "!" in the center — something needs attention.
-                let dotR: CGFloat = 0.95
-                NSColor.black.setFill()
-                let barTop = c.y + 3.4, barH: CGFloat = 4.6
-                NSBezierPath(ovalIn: CGRect(x: c.x - dotR, y: barTop + 1.6,
-                                            width: dotR * 2, height: dotR * 2)).fill()
-                let barW: CGFloat = 1.7, barX = c.x - barW / 2
-                let barRect = CGRect(x: barX, y: c.y - 4.1, width: barW, height: barH)
-                NSBezierPath(roundedRect: barRect, xRadius: 0.85, yRadius: 0.85).fill()
-            } else {
-                // The ball, seated in the groove.
-                let ballR: CGFloat = 4.1
-                NSColor.black.setFill()
-                NSBezierPath(ovalIn: CGRect(x: c.x - ballR, y: c.y - ballR,
-                                            width: ballR * 2, height: ballR * 2)).fill()
-            }
-            return true
-        }
-        img.isTemplate = true
-        img.accessibilityDescription = warning ? "BallScroll — attention needed" : "BallScroll"
-        return img
-    }
-
     private func rebuildMenu() {
         guard let button = statusItem.button else { return }
         let ok = prefs.hasAccessibilityPermission && prefs.hasInputMonitoringPermission && BallScrollEngine.shared.isTrackballConnected()
-        button.image = AppDelegate.menuBarIcon(warning: !ok)
+        button.image = BallScrollIconRenderer.menuBarIcon(warning: !ok)
 
         let menu = NSMenu()
         let trusted = prefs.hasAccessibilityPermission
@@ -246,15 +207,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         prefs.persist()
     }
 
-    @objc func showSettings(tab: Int = 0) {
+    @objc func showSettings() {
+        // "Normal app" behavior while settings are open: Dock (left) + menu-bar
+        // (right-top). .accessory → no Dock icon; .regular → both. (LSUIElement
+        // in Info.plist keeps it menu-bar-only at launch / when closed.)
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         if settingsWindowController == nil {
             let wc = SettingsWindowController(prefs: prefs, onClosed: { [weak self] in
-                self?.settingsWindowController = nil
+                guard let self else { return }
+                self.settingsWindowController = nil
+                // Settings closed → back to menu-bar only (no Dock icon).
+                NSApp.setActivationPolicy(.accessory)
             })
             settingsWindowController = wc
         }
-        settingsWindowController?.show(tab: tab)
+        settingsWindowController?.show()
     }
 
     @objc private func quit() {

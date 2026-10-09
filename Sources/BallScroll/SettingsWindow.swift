@@ -1,318 +1,324 @@
-//  SettingsWindow.swift — SwiftUI settings window (NFR-1, AM parity).
-//  Tabs: Scroll / Advanced / General.
+//  SettingsWindow.swift — single-window settings (NFR-1, AM parity).
+//  No tabs: scroll-button config on top, all other settings below it.
+//
+//  UI details per user feedback:
+//   * window uses a fixed .aqua appearance so toggles/sliders keep their colors
+//     when the window loses focus (no "everything goes grey" on app switch);
+//   * every option has a small "?" help bubble (NSPopover — always visible,
+//     shown on hover/click of the icon) explaining what it does;
+//   * "Scroll deadzone" range is 0–100 px;
+//   * the window sizes exactly to its content (no empty space at the bottom);
+//   * the decorative red ball carries texture speckles like a real Marble Mouse.
 
 import AppKit
 import SwiftUI
 
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onClosed: () -> Void
 
     init(prefs: PreferencesModel, onClosed: @escaping () -> Void) {
         self.onClosed = onClosed
 
-        let root = SettingsRootView(prefs: prefs)
-            .frame(width: 560, height: 420)
+        let root = SettingsView(prefs: prefs)
         let hosting = NSHostingController(rootView: root)
 
         let window = NSWindow(contentViewController: hosting)
-        window.title = "BallScroll Settings"
+        window.title = "BallScroll"
+        // .resizable omitted → fixed-width single page, no tabs. Height follows
+        // the content exactly (NSHostingController keeps preferredContentSize in
+        // sync) → no dead space below the last row.
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 560, height: 420))
-        window.center()
+        // Fixed appearance: controls keep full color even when the window is not
+        // key / another app is active (no greyed-out unfocused look).
+        window.appearance = NSAppearance(named: .aqua)
 
         super.init(window: window)
+        // Make ourselves the delegate so windowWillClose fires when the user
+        // closes the window (otherwise onClosed never runs and the activation
+        // policy stays .regular / Dock icon lingers).
+        window.delegate = self
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(tab: Int = 0) {
+    func show() {
         window?.makeKeyAndOrderFront(nil)
     }
 
     func windowWillClose(_ notification: Notification) { onClosed() }
 }
 
-// MARK: - Root tab view
+// MARK: - Help. We use SwiftUI's native `.help("…")` tooltips on each option —
+// hovering the row shows a bubble just above it (no separate "?" icon). This is
+// the standard macOS affordance and needs no @State / NSViewRepresentable, so it
+// compiles cleanly under standalone `xcrun swiftc`.
 
-struct SettingsRootView: View {
+// MARK: - Single settings page
+
+struct SettingsView: View {
     @ObservedObject var prefs: PreferencesModel
 
-    var body: some View {
-        TabView(selection: .constant(0)) {
-            ScrollTab(prefs: prefs).tabItem { Label("Scroll", systemImage: "arrow.up.arrow.down") }
-                .tag(0)
-            AdvancedTab(prefs: prefs).tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
-                .tag(1)
-            GeneralTab(prefs: prefs).tabItem { Label("General", systemImage: "gearshape") }
-                .tag(2)
-        }
+    // Log-scaled inertia DECAY TIME: slider position 0…1 ↔ decay 25…1000 ms.
+    // The lever means "how long after release it takes to brake smoothly to a stop".
+    // Log scale = fine precision at the low end (25…~160 ms occupies the left ~48%
+    // of travel in sub-millisecond steps) — that's where "barely any inertia" lives;
+    // coarser toward 1000 ms (a long roll-out).
+    private let INERTIA_DECAY_MIN: Double = 25     // ms — imperceptible
+    private let INERTIA_DECAY_MAX: Double = 1000   // ms — long roll-out
+
+    var inertiaDecayBinding: Binding<Double> {
+        Binding(
+            get: {
+                let s = min(max(prefs.inertiaDecayMs, INERTIA_DECAY_MIN), INERTIA_DECAY_MAX)
+                return log(s / INERTIA_DECAY_MIN) / log(INERTIA_DECAY_MAX / INERTIA_DECAY_MIN)
+            },
+            set: { p in
+                let s = INERTIA_DECAY_MIN * pow(INERTIA_DECAY_MAX / INERTIA_DECAY_MIN, min(max(p, 0), 1))
+                prefs.inertiaDecayMs = s   // persist() fires via onChange(of: inertiaDecayMs) below
+            }
+        )
     }
-}
 
-// MARK: - Scroll tab (PRD §9)
-
-struct ScrollTab: View {
-    @ObservedObject var prefs: PreferencesModel
+    // Decorative ball geometry (matches BallScrollIconRenderer proportions).
+    private let ballSize: CGFloat = 74
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // Usage tip (dynamic per chosen button — AM style).
-            Text("Hold **\(prefs.activatorPosition.displayName)** then roll the ball to scroll.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 18) {
+            scrollSection
+            Divider()
+            behaviorSection
+            Divider()
+            generalSection
+        }
+        .padding(16)
+        .frame(width: 540, alignment: .top)
+        .onChange(of: prefs.invertDirection) { _, _ in prefs.persist() }
+        .onChange(of: prefs.horizontalScrolling) { _, _ in prefs.persist() }
+        .onChange(of: prefs.speedMultiplier) { _, _ in prefs.persist() }
+        .onChange(of: prefs.emulateInertia) { _, _ in prefs.persist() }
+        .onChange(of: prefs.deadzonePx) { _, _ in prefs.persist() }
+        .onChange(of: prefs.inertiaDecayMs) { _, _ in prefs.persist() }
+    }
 
-            // Scroll button picker (FR-5): T-BC21 diagram + single-position probe.
-            GroupBox("Scroll button") {
-                VStack(alignment: .leading, spacing: 10) {
-                    TrackballDiagram(prefs: prefs) { position in
-                        // Clicked a diagram button → single-position probe (FR-5/10).
-                        if prefs.probeActivePosition == position {
+    // MARK: Scroll button — ball (decorative) + one clickable button + code.
+
+    private var scrollSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 26) {
+                decorativeBall
+
+                VStack(alignment: .leading, spacing: 8) {
+                    // The one clickable button. Click → wait for the user to press
+                    // their trackball's scroll button; that becomes it. Resting
+                    // colour is dark grey; while the (currently set) trackball
+                    // button is held, it turns bright red. Text stays centered.
+                    Button {
+                        if prefs.probeActivePosition != nil && !prefs.probeSequential {
                             prefs.cancelProbe()
                         } else {
-                            prefs.startSingleProbe(position)
+                            prefs.startSingleProbe(.smallRight) // any button: the press wins
                         }
+                    } label: {
+                        ZStack {   // centered by default → text sits in the middle
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(buttonFill)
+                            HStack(spacing: 6) {
+                                Image(systemName: "cursorarrow.click.2")
+                                Text(prefs.probeActivePosition != nil ? "Press it on the trackball" : "Set scroll button")
+                                    .fontWeight(.semibold)
+                            }
+                            .foregroundStyle(.white)
+                        }
+                        .frame(width: 240, height: 54)
                     }
+                    .buttonStyle(.plain)
+                    .help("Click, then press the trackball button you want to use for scroll. While that button is held on the trackball, this button stays bright red.")
+
+                    // Current scroll button as plain text; hover it for the bubble.
+                    HStack(spacing: 6) {
+                        Text("Currently selected button: \(prefs.activatorCGButton)")
+                            .font(.system(size: 13, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.primary)
+                    }
+                    .help("This is the button number macOS sees when you press your scroll button. Press and hold that button on the trackball — \"Set scroll button\" above turns bright red while you're holding it, proving it's wired up. Change it by clicking the button and pressing a different one.")
 
                     if prefs.probeActivePosition != nil {
                         HStack(spacing: 8) {
-                            Circle().fill(.blue).frame(width: 8, height: 8)
-                            Text(prefs.probeStatusText)
+                            Circle().fill(.blue).frame(width: 7, height: 7)
+                            Text(prefs.probeSequential ? prefs.probeStatusText
+                                                       : "Waiting — press the button you want to use for scrolling.")
                                 .font(.caption)
                             Spacer()
                             Button("Cancel") { prefs.cancelProbe() }
                                 .controlSize(.small)
                         }
-                    } else {
-                        Text("Click a button in the diagram, then press it on the trackball to make it your scroll button. (Each physical button is detected from its raw HID report — no guessing.)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if !prefs.probeCompleted {
-                        Button("Probe all buttons…") { prefs.startSequentialProbe() }
-                            .controlSize(.small)
                     }
                 }
+
+                Spacer(minLength: 0)
             }
 
-            // Direction invert (FR-4).
-            Toggle(isOn: $prefs.invertDirection) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Invert scroll direction")
-                    Text("Aligns the ball with trackpad \"natural\" scrolling — flipping it makes rolling up/down match your trackpad feel.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            if !prefs.probeCompleted {
+                HStack(spacing: 6) {
+                    Button("Probe all buttons…") { prefs.startSequentialProbe() }
+                        .controlSize(.small)
                 }
+                .help("Walks through every trackball button in turn and records each one. Usually not needed — the \"Set scroll button\" flow above is enough for a single scroll button.")
             }
+        }
+    }
 
-            // Horizontal toggle (FR-3, default OFF).
-            Toggle(isOn: $prefs.horizontalScrolling) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enable horizontal scrolling")
-                    Text("Off = vertical only (sideways roll does nothing). On = rolling sideways also scrolls horizontally.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+    /// Glossy red ball with texture speckles — decorative, not clickable.
+    private var decorativeBall: some View {
+        ZStack {
+            Circle()
+                .fill(RadialGradient(
+                    gradient: Gradient(colors: [Color(red: 0.98, green: 0.45, blue: 0.4),
+                                                Color(red: 0.92, green: 0.2, blue: 0.23),
+                                                Color(red: 0.58, green: 0.07, blue: 0.1)]),
+                    center: .init(x: 0.35, y: 0.3),
+                    startRadius: 2, endRadius: ballSize * 0.62))
+            // Tiny texture speckles — identical layout to the app icon (dense even
+            // field). AppKit is y-up so flip Y for SwiftUI's y-down coords. Dot
+            // diameter = sp.r * ballSize (sp.r is a fraction of ball radius, so
+            // 2·(sp.r·R) = sp.r·ballSize).
+            ForEach(Array(BallScrollIconRenderer.ballSpeckles.enumerated()), id: \.offset) { _, sp in
+                Circle()
+                    .fill(Color.black.opacity(0.34))
+                    .frame(width: sp.r * ballSize, height: sp.r * ballSize)
+                    .offset(x: sp.p.x * (ballSize / 2), y: -sp.p.y * (ballSize / 2))
             }
+            Circle().stroke(Color.black.opacity(0.35), lineWidth: 2)
+        }
+        .frame(width: ballSize, height: ballSize)
+    }
 
-            // Scroll speed (FR-6, default 3).
+    private var buttonFill: Color {
+        // Bright red while the currently-set scroll button is physically held on
+        // the trackball; dark grey otherwise. (No timed flash — stays red for as
+        // long as it's held, grey on release.)
+        if prefs.activatorPressed {
+            return Color(red: 1.0, green: 0.24, blue: 0.2)
+        }
+        return Color(red: 0.32, green: 0.34, blue: 0.37)   // dark grey
+    }
+
+    private var behaviorSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: $prefs.invertDirection) { Text("Invert scroll direction") }
+                .toggleStyle(.switch)
+                .help("Reverses the scroll direction: rolling the ball forward scrolls down instead of up (or vice versa).")
+
+            Toggle(isOn: $prefs.horizontalScrolling) { Text("Enable horizontal scrolling") }
+                .toggleStyle(.switch)
+                .help("Rolling the ball side to side scrolls horizontally (wide pages, timelines). Off = only vertical scrolling.")
+
             VStack(alignment: .leading, spacing: 4) {
-                Text("Scroll speed: \(prefs.speedMultiplier, format: .number.precision(.fractionLength(1)))")
+                HStack(spacing: 5) {
+                    Text("Scroll speed")
+                    Spacer()
+                    Text("\(prefs.speedMultiplier, format: .number.precision(.fractionLength(1)))")
+                        .monospacedDigit().foregroundStyle(.secondary)
+                }
                 Slider(value: $prefs.speedMultiplier, in: 1...20)
-                Text("Controls how much ball motion is scaled into scrolling. Higher = the page moves further per unit of ball travel (matches Abnormal Mouse's \"Scroll speed\").")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
+            .help("How far the page moves per unit of ball rotation. Higher = faster scrolling.")
 
-            // Inertia (FR-7, default ON).
-            Toggle(isOn: $prefs.emulateInertia) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Emulate inertia effect")
-                    Text("Adds a short decay tail after you stop rolling. Some apps (e.g. certain web views) respond more smoothly to this than raw pixel scroll.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            Toggle(isOn: $prefs.emulateInertia) { Text("Emulate inertia effect") }
+                .toggleStyle(.switch)
+                .help("Adds a short glide after you stop rolling, so scrolling feels like it has momentum instead of stopping instantly.")
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text("Inertia decay time")
+                    Spacer()
+                    Text(prefs.inertiaDecayMs < 100 ? String(format: "%.0f ms", prefs.inertiaDecayMs)
+                                                     : String(format: "%.2f s", prefs.inertiaDecayMs / 1000))
+                        .monospacedDigit().foregroundStyle(.secondary)
                 }
+                // Log-scaled slider (position 0…1 ↔ decay 25…1000 ms). Fine
+                // precision at the low end; coarser toward 1 s.
+                Slider(value: inertiaDecayBinding, in: 0...1)
             }
+            .disabled(!prefs.emulateInertia)
+            .help("How long the scroll keeps coasting AFTER you release — a smooth brake from your release speed down to a stop. Lower = stops almost immediately (25 ms ≈ no visible inertia); higher = it keeps rolling for a while (1 s is a long roll-out). The scale is logarithmic, so the left half gives fine control in the low range where 'barely any inertia' lives.")
 
-            Spacer()
-        }
-        .padding(16)
-        .onChange(of: prefs.invertDirection) { _, _ in prefs.persist() }
-        .onChange(of: prefs.horizontalScrolling) { _, _ in prefs.persist() }
-        .onChange(of: prefs.speedMultiplier) { _, _ in prefs.persist() }
-        .onChange(of: prefs.emulateInertia) { _, _ in prefs.persist() }
-    }
-}
-
-// MARK: - T-BC21 button diagram (FR-5)
-
-struct TrackballDiagram: View {
-    @ObservedObject var prefs: PreferencesModel
-    let onSelect: (ProbePosition) -> Void
-
-    private func buttonStyle(_ pos: ProbePosition, size: CGSize) -> some View {
-        let isActive = prefs.probeActivePosition == pos
-        let isActivator = prefs.bit(for: pos) == prefs.activatorBit
-        return Button {
-            onSelect(pos)
-        } label: {
-            ZStack(alignment: .bottom) {
-                RoundedRectangle(cornerRadius: size.height / 4)
-                    .fill(isActivator ? Color.accentColor.opacity(0.55)
-                            : isActive ? Color.orange.opacity(0.6)
-                            : Color.secondary.opacity(0.25))
-                VStack(spacing: 1) {
-                    if isActivator { Image(systemName: "checkmark").font(.caption2) }
-                    Text(pos.displayName.uppercased())
-                        .font(.system(size: 8, weight: .bold))
-                        .lineLimit(2)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text("Scroll deadzone")
+                    Spacer()
+                    Text("\(prefs.deadzonePx, format: .number.precision(.fractionLength(0))) px")
+                        .monospacedDigit().foregroundStyle(.secondary)
                 }
-                .foregroundStyle(.white)
-                .padding(4)
+                Slider(value: $prefs.deadzonePx, in: 0...100)
             }
-            .frame(width: size.width, height: size.height)
+            .help("How much tiny ball wobble (in pixels of raw movement) to ignore before scrolling starts. Stops a loose/wobbly ball or hand tremor from causing accidental scroll jumps. 0 = off (most responsive).")
         }
-        .buttonStyle(.plain)
     }
 
-    var body: some View {
-        HStack(alignment: .center, spacing: 18) {
-            // Big buttons (left/right).
-            HStack(spacing: 10) {
-                buttonStyle(.largeLeft, size: CGSize(width: 52, height: 34))
-                buttonStyle(.largeRight, size: CGSize(width: 52, height: 34))
-            }
-            .padding(.bottom, 18)
-
-            // Ball.
-            ZStack {
-                Circle().fill(
-                    RadialGradient(colors: [Color.primary.opacity(0.5), Color.primary.opacity(0.18)],
-                                   center: .topLeading, startRadius: 2, endRadius: 46)
-                )
-                Circle().stroke(Color.secondary.opacity(0.5), lineWidth: 1)
-            }
-            .frame(width: 46, height: 46)
-
-            // Small buttons (side / extra).
-            VStack(spacing: 10) {
-                buttonStyle(.smallLeft, size: CGSize(width: 40, height: 26))
-                buttonStyle(.smallRight, size: CGSize(width: 40, height: 26))
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
-}
-
-// MARK: - Advanced tab
-
-struct AdvancedTab: View {
-    @ObservedObject var prefs: PreferencesModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            GroupBox("Scroll deadzone (FR-13)") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Minimum ball movement before scrolling starts: \(prefs.deadzonePx, format: .number.precision(.fractionLength(0))) px")
-                    Slider(value: $prefs.deadzonePx, in: 0...10)
-                    Text("Absorbs tiny jitter so the cursor never scrolls on its own. Raise if you see scroll creep without rolling.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            GroupBox("Per-app exclusions") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Coming in v1.1 — disable BallScroll for specific apps (Abnormal Mouse \"Advanced\" parity).")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            GroupBox("Modifier-gated horizontal") {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Coming in v1.1 — hold ⌥ while scrolling to scroll horizontally, instead of the plain toggle.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Spacer()
-        }
-        .padding(16)
-        .onChange(of: prefs.deadzonePx) { _, _ in prefs.persist() }
-    }
-}
-
-// MARK: - General tab (FR-11) + About
-
-struct GeneralTab: View {
-    @ObservedObject var prefs: PreferencesModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14)
-        {
-            Toggle(isOn: $prefs.loginItemEnabled) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Automatically start at login") // AM's exact label (PRD §9)
-                    Text("BallScroll launches after reboot via the system Login Items (SMAppService).")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+    private var generalSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: $prefs.loginItemEnabled) { Text("Automatically start at login") }
+                .toggleStyle(.switch)
+                .help("Launch BallScroll automatically when you sign in to macOS, so your trackball scroll button works from boot. While the settings window is open the app also shows its icon in the Dock; when it's closed only the menu-bar icon remains.")
 
             Divider()
 
-            // Device status.
             HStack(spacing: 8) {
-                Circle()
-                    .fill(prefs.trackballConnected ? Color.green : Color.red)
+                Circle().fill(prefs.trackballConnected ? Color.green : Color.red)
                     .frame(width: 10, height: 10)
                 if prefs.trackballConnected {
-                    Text("Logitech USB Trackball (0x46D:0xC3C) detected")
+                    Text("Logitech USB Trackball (0x46D:0xC3C) connected").font(.callout)
                 } else {
-                    if prefs.hasInputMonitoringPermission {
-                        Text("Trackball not detected — plug in the T-BC21")
-                    } else {
-                        Text("Trackball not detected — needs Input Monitoring (below)")
-                    }
+                    Text(prefs.hasInputMonitoringPermission ? "Trackball not connected"
+                                                            : "Trackball not detected — needs Input Monitoring")
+                        .font(.callout)
                 }
             }
-            .font(.callout)
+            .help(prefs.trackballConnected
+                  ? "Your trackball is plugged in and being read. Green = working."
+                  : "The trackball isn't being seen. Plug it in, or grant Input Monitoring so macOS lets the app read its raw reports.")
 
-            if !prefs.hasAccessibilityPermission {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text("Accessibility permission required")
-                    Button("Open System Settings…") { AXPermissions.openAccessibilitySettings() }
-                }
-            }
-
-            if !prefs.hasInputMonitoringPermission {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text("Input Monitoring permission required (raw trackball read)")
-                    Button("Open System Settings…") { AXPermissions.openInputMonitoringSettings() }
-                }
-            }
+            if !prefs.hasAccessibilityPermission { permissionRow("Accessibility", AXPermissions.openAccessibilitySettings) }
+            if !prefs.hasInputMonitoringPermission { permissionRow("Input Monitoring", AXPermissions.openInputMonitoringSettings) }
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("BallScroll \(appVersion)")
-                    .font(.headline)
-                Text("A thin menu-bar utility that turns your Logitech T-BC21 trackball's held-button + ball motion into scroll — vertical-only by default, with invertible direction. Built to replace Abnormal Mouse's \"Move to Scroll\".")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                BallScrollAppIconSmall().frame(width: 28, height: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("BallScroll \(appVersion)").font(.callout.weight(.semibold))
+                    Text("Hold the scroll button and roll to scroll.").font(.caption).foregroundStyle(.secondary)
+                }
             }
-
-            Spacer()
         }
-        .padding(16)
+    }
+
+    private func permissionRow(_ title: String, _ open: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Text("\(title) permission required")
+            Button("Open System Settings…", action: open)
+        }
     }
 
     private var appVersion: String {
-        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
-        return v
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.0"
+    }
+}
+
+// MARK: - Small colored app icon (for the settings footer) — shares its drawing
+// with AppDelegate's menu-bar icon so both match.
+
+struct BallScrollAppIconSmall: View {
+    private let image: NSImage
+
+    init() {
+        self.image = BallScrollIconRenderer.appIcon(sizePt: 28)
+    }
+
+    var body: some View {
+        Image(nsImage: image).resizable()
     }
 }
